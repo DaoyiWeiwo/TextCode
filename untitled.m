@@ -12,6 +12,35 @@ total_img_bits = length(img_bitstream);
 fprintf('总图像比特数: %d\n', total_img_bits);
 
 %% 系统参数设置
+bandwidth_GHz = 20;       % 信号带宽20GHz
+carrier_freq_GHz = 11;    % 上变频中心频率11GHz
+sampling_rate_GHz = 60;   % 采样率60GHz
+rolloff_factor = 0.25;         % RRC滤波器滚降系数
+filter_span_symbols = 6;       % RRC滤波器跨越的符号数
+
+% RRC滤波器设计
+% 注意: bandwidth_GHz 被解释为RRC滤波后信号的双边带宽
+symbol_rate_GHz = bandwidth_GHz / (1 + rolloff_factor);
+samples_per_symbol = sampling_rate_GHz / symbol_rate_GHz;
+fprintf('  符号速率: %.2f GHz\n', symbol_rate_GHz);
+fprintf('  每个符号的采样数 (SPS): %.2f\n', samples_per_symbol);
+
+% 检查SPS是否为整数或合理的倒数
+if mod(samples_per_symbol, 1) ~= 0
+    fprintf('警告: 每个符号的采样数 (SPS) 不是整数 (%.2f)。这可能导致插值/抽取问题。\n', samples_per_symbol);
+    fprintf('请检查 bandwidth_GHz (%.2f GHz), sampling_rate_GHz (%.2f GHz), 和 rolloff_factor (%.2f) 的设置。\n', bandwidth_GHz, sampling_rate_GHz, rolloff_factor);
+    % 尝试找到一个接近的整数SPS，如果原始计算结果非常接近某个整数的倒数的小倍数，
+    % 或者调整符号速率以匹配整数SPS
+    % 简单的处理：四舍五入到最近的整数，但这可能不总是最佳选择
+    % For now, let's proceed with the calculated SPS and user can adjust if needed.
+    % More robust handling might involve adjusting symbol rate or sampling rate slightly.
+end
+
+rrc_filter_coeffs = rcosdesign(rolloff_factor, filter_span_symbols, samples_per_symbol, 'sqrt');
+
+% 归一化滤波器系数以保持信号功率
+rrc_filter_coeffs = rrc_filter_coeffs / sqrt(sum(rrc_filter_coeffs.^2));
+
 polar_block_K = 128;
 polar_block_E = 256;
 L_polar = 16;
@@ -174,7 +203,31 @@ while data_symbols_written_count < total_data_symbols
     end
 end
 
-tx_symbols = final_tx_symbols;
+fprintf('\n=== RRC 发射滤波 ===\n');
+% samples_per_symbol might be fractional.
+% For upfirdn, we need an integer upsampling factor.
+% We will use P = round(samples_per_symbol) for upsampling.
+% The rrc_filter_coeffs were designed using the original samples_per_symbol.
+
+P_tx = round(samples_per_symbol);
+if abs(P_tx - samples_per_symbol) > 1e-3 % Check if rounding introduced significant error
+    fprintf('警告: RRC发射端 P_tx=%d 被用于升采样, 而计算的SPS=%.2f. 波形可能会失真。\n', P_tx, samples_per_symbol);
+end
+
+% Upsample and filter
+% Ensure final_tx_symbols is a column vector for upfirdn
+if ~iscolumn(final_tx_symbols)
+    final_tx_symbols_col = final_tx_symbols.';
+else
+    final_tx_symbols_col = final_tx_symbols;
+end
+
+tx_shaped_symbols = upfirdn(final_tx_symbols_col, rrc_filter_coeffs, P_tx, 1);
+fprintf('  发射滤波后符号数: %d (升采样因子 P_tx=%d)\n', length(tx_shaped_symbols), P_tx);
+
+% Update tx_symbols to be the shaped signal
+tx_symbols = tx_shaped_symbols; % This line replaces the original tx_symbols = final_tx_symbols;
+% Recalculate payload_ratio with the new length of tx_symbols (after filtering and upsampling)
 payload_ratio = 100 * total_data_symbols / length(tx_symbols);
 encoding_time = toc;
 fprintf('编码完成，总符号数: %d，有效载荷率: %.1f%%，用时 %.2f 秒\n', ...
@@ -274,6 +327,36 @@ preamble_len_in_rx_synced = zc_length + length(m_seq) + length(phase_ref_symbols
 time_indices_phase = (0:length(rx_synced)-1)';
 phase_corr_vector = exp(-1j * 2 * pi * final_freq_estimate .* time_indices_phase);
 rx_freq_corrected = rx_synced .* phase_corr_vector;
+
+fprintf('\n步骤2.5: RRC 接收滤波...\n');
+rx_filter_start_time = tic;
+
+% Ensure rx_freq_corrected is a column vector
+if ~iscolumn(rx_freq_corrected)
+    rx_freq_corrected_col = rx_freq_corrected.';
+else
+    rx_freq_corrected_col = rx_freq_corrected;
+end
+
+% P_rx should be the same as P_tx used in the transmitter for symmetric up/down sampling
+P_rx = round(samples_per_symbol); % Or use P_tx if it was stored globally or recalculated
+
+% Filter and downsample
+% The rrc_filter_coeffs are already normalized from the design phase.
+rx_filtered_signal = upfirdn(rx_freq_corrected_col, rrc_filter_coeffs, 1, P_rx);
+
+% Update rx_freq_corrected to be the filtered and downsampled signal
+% All subsequent operations (phase tracking, LLR, etc.) will use this.
+rx_freq_corrected = rx_filtered_signal;
+
+rx_filter_time = toc(rx_filter_start_time);
+fprintf('  RRC接收滤波完成，输出符号数: %d (下采样因子 P_rx=%d)\n', length(rx_freq_corrected), P_rx);
+fprintf('  RRC接收滤波用时: %.3f秒\n', rx_filter_time);
+
+% Add rx_filter_time to total_time calculation later in the script.
+% This will be handled in a subsequent step if necessary, for now, focus on adding the filter.
+
+% 计算预期中间导频位置
 
 % 计算预期中间导频位置
 expected_midamble_positions = [];
